@@ -1,0 +1,17 @@
+# Build output
+target/
+dependency-reduced-pom.xml
+
+# IDE files
+.classpath
+.project
+.settings/
+.idea/
+*.iml
+
+# Environment / secrets
+.env
+.env.*
+
+# SIP log files (may contain auth traces)
+*.log
