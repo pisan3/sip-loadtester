@@ -6,13 +6,21 @@ import com.loadtester.scenario.CallScenario;
 import com.loadtester.scenario.ConcurrentCallScenario;
 import com.loadtester.scenario.SustainedLoadScenario;
 import com.loadtester.sip.DefaultSipStackFactory;
+import com.loadtester.tui.InteractiveApp;
 
 import java.net.InetAddress;
+import java.nio.file.Path;
 
 /**
  * CLI entry point for the SIP load tester.
  * <p>
+ * When launched with no arguments or {@code --interactive}, opens the interactive
+ * terminal UI (TUI) for configuring and running tests. Otherwise, runs in CLI mode
+ * with the specified flags.
+ * <p>
  * Usage:
+ *   java -jar sip-loadtester.jar                    (interactive TUI)
+ *   java -jar sip-loadtester.jar --interactive       (interactive TUI)
  *   java -jar sip-loadtester.jar \
  *     --proxy-host 10.0.0.1 --proxy-port 5060 --domain example.com \
  *     --a-user alice --a-password secret1 \
@@ -22,6 +30,12 @@ import java.net.InetAddress;
 public class Main {
 
     public static void main(String[] args) {
+        // Launch interactive TUI if no args or --interactive flag
+        if (args.length == 0 || (args.length == 1 && "--interactive".equals(args[0]))) {
+            new InteractiveApp(Path.of(".env")).run();
+            return;
+        }
+
         try {
             Config cfg = parseArgs(args);
             if (cfg == null) {
@@ -108,6 +122,10 @@ public class Main {
                 case "--call-duration" -> cfg.callDuration = Long.parseLong(args[++i]);
                 case "--total-duration" -> cfg.totalDuration = Long.parseLong(args[++i]);
                 case "--help", "-h" -> { printUsage(); System.exit(0); }
+                case "--interactive" -> {
+                    new InteractiveApp(Path.of(".env")).run();
+                    System.exit(0);
+                }
                 default -> {
                     System.err.println("Unknown argument: " + args[i]);
                     return null;
@@ -155,6 +173,7 @@ public class Main {
         System.out.println("  --call-duration <ms>    Duration of each call in sustained mode (default: 30000)");
         System.out.println("  --total-duration <ms>   Total test duration in sustained mode (default: 60000)");
         System.out.println("  -h, --help              Show this help");
+        System.out.println("  --interactive           Launch interactive terminal UI (default if no args)");
     }
 
     private static class Config {

@@ -3,29 +3,30 @@ package com.loadtester.scenario;
 import com.loadtester.config.SipAccountConfig;
 import com.loadtester.report.TestReport;
 import com.loadtester.sip.DefaultSipStackFactory;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import static org.assertj.core.api.Assertions.*;
 
 /**
  * Integration test for SustainedLoadScenario using real SIP credentials.
  * <p>
- * Maintains 20 concurrent calls (10 seconds each) for 2 minutes total,
+ * Maintains 30 concurrent calls (10 seconds each) for 1 minute total,
  * cycling through calls as they complete.
  * <p>
- * This test is @Disabled by default and meant to be run manually.
+ * This test is skipped unless SIP_DOMAIN env var is set.
  * Credentials are read from environment variables (see .env file).
  * <p>
  * Run with:
  *   source .env && mvn test \
- *     -Dtest="SustainedLoadScenarioIntegrationTest#twentyConcurrentCallsSustainedTwoMinutes" \
+ *     -Dtest="SustainedLoadScenarioIntegrationTest#thirtyConcurrentCallsSustainedOneMinute" \
  *     -Dsurefire.failIfNoSpecifiedTests=false
  */
 class SustainedLoadScenarioIntegrationTest {
 
     @Test
-    void twentyConcurrentCallsSustainedTwoMinutes() {
+    @EnabledIfEnvironmentVariable(named = "SIP_DOMAIN", matches = ".+")
+    void thirtyConcurrentCallsSustainedOneMinute() {
         String domain = System.getenv("SIP_DOMAIN");
         String proxyHost = System.getenv("SIP_PROXY_HOST");
         int proxyPort = Integer.parseInt(System.getenv().getOrDefault("SIP_PROXY_PORT", "5060"));

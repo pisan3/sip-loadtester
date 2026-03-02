@@ -2,6 +2,9 @@
 target/
 dependency-reduced-pom.xml
 
+# Keep the release JAR in the repo root
+!sip-loadtester.jar
+
 # IDE files
 .classpath
 .project

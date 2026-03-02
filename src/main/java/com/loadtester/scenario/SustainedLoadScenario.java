@@ -38,7 +38,6 @@ public class SustainedLoadScenario {
 
     private static final double TONE_FREQUENCY = 1000.0;
     private static final double TONE_AMPLITUDE = 0.8;
-    private static final int STAGGER_DELAY_MS = 500;
     private static final int STATS_INTERVAL_SECONDS = 5;
     private static final double TONE_SAMPLE_RATE = 0.10; // 10% of calls
 
@@ -50,6 +49,10 @@ public class SustainedLoadScenario {
     private long callDurationMs = 30_000;
     private long totalDurationMs = 60_000;
     private int timeoutSeconds = 30;
+    private int staggerDelayMs = 500;
+
+    // --- Stop control ---
+    private volatile boolean stopRequested;
 
     // --- Metrics ---
     private final AtomicLong callsStarted = new AtomicLong();
@@ -59,6 +62,10 @@ public class SustainedLoadScenario {
     private final ConcurrentLinkedQueue<Long> setupLatencies = new ConcurrentLinkedQueue<>();
     private final AtomicInteger toneTestsPassed = new AtomicInteger();
     private final AtomicInteger toneTestsTotal = new AtomicInteger();
+    private volatile Instant scenarioStart;
+
+    // --- Event callback for TUI ---
+    private volatile ScenarioEventListener eventListener;
 
     // Shared executor for RTP send/receive threads (set during execute())
     private volatile ExecutorService executor;
@@ -75,8 +82,53 @@ public class SustainedLoadScenario {
     public void setCallDurationMs(long callDurationMs) { this.callDurationMs = callDurationMs; }
     public void setTotalDurationMs(long totalDurationMs) { this.totalDurationMs = totalDurationMs; }
     public void setTimeoutSeconds(int timeoutSeconds) { this.timeoutSeconds = timeoutSeconds; }
+    public void setStaggerDelayMs(int staggerDelayMs) { this.staggerDelayMs = staggerDelayMs; }
+    public void setEventListener(ScenarioEventListener listener) { this.eventListener = listener; }
 
-    // Visible for testing
+    /**
+     * Request the scenario to stop gracefully. No new calls will be launched
+     * and the main loop will exit after in-flight calls finish.
+     */
+    public void requestStop() {
+        this.stopRequested = true;
+        fireEvent("Stop requested — finishing in-flight calls...");
+    }
+
+    public boolean isStopRequested() { return stopRequested; }
+
+    // --- Public metric accessors for TUI dashboard ---
+    public long getCallsStartedCount() { return callsStarted.get(); }
+    public long getCallsCompletedCount() { return callsCompleted.get(); }
+    public long getCallsFailedCount() { return callsFailed.get(); }
+    public int getActiveCallsCount() { return activeCalls.get(); }
+    public int getConcurrentCalls() { return concurrentCalls; }
+    public long getTotalDurationMs() { return totalDurationMs; }
+    public Instant getScenarioStart() { return scenarioStart; }
+
+    public long getAvgSetupLatencyMs() {
+        List<Long> snapshot = new ArrayList<>(setupLatencies);
+        if (snapshot.isEmpty()) return 0;
+        return snapshot.stream().mapToLong(Long::longValue).sum() / snapshot.size();
+    }
+
+    public long getP95SetupLatencyMs() {
+        List<Long> snapshot = new ArrayList<>(setupLatencies);
+        if (snapshot.isEmpty()) return 0;
+        Collections.sort(snapshot);
+        return snapshot.get(Math.min((int) (snapshot.size() * 0.95), snapshot.size() - 1));
+    }
+
+    public long getP99SetupLatencyMs() {
+        List<Long> snapshot = new ArrayList<>(setupLatencies);
+        if (snapshot.isEmpty()) return 0;
+        Collections.sort(snapshot);
+        return snapshot.get(Math.min((int) (snapshot.size() * 0.99), snapshot.size() - 1));
+    }
+
+    public int getToneTestsPassedCount() { return toneTestsPassed.get(); }
+    public int getToneTestsTotalCount() { return toneTestsTotal.get(); }
+
+    // Package-private accessors for existing unit tests
     AtomicLong getCallsStarted() { return callsStarted; }
     AtomicLong getCallsCompleted() { return callsCompleted; }
     AtomicLong getCallsFailed() { return callsFailed; }
@@ -84,6 +136,7 @@ public class SustainedLoadScenario {
     ConcurrentLinkedQueue<Long> getSetupLatencies() { return setupLatencies; }
     AtomicInteger getToneTestsPassed() { return toneTestsPassed; }
     AtomicInteger getToneTestsTotal() { return toneTestsTotal; }
+    int getStaggerDelayMs() { return staggerDelayMs; }
 
     /**
      * Execute the sustained load scenario and return a test report.
@@ -93,7 +146,7 @@ public class SustainedLoadScenario {
                 String.format("Sustained Load (%d concurrent, %ds)", concurrentCalls, totalDurationMs / 1000));
         executor = Executors.newCachedThreadPool();
         ScheduledExecutorService statsScheduler = Executors.newSingleThreadScheduledExecutor();
-        Instant scenarioStart = Instant.now();
+        scenarioStart = Instant.now();
 
         // --- B-phone setup ---
         RtpSession rtpSessionBDefault = new UdpRtpSession();
@@ -172,7 +225,7 @@ public class SustainedLoadScenario {
             long deadline = System.currentTimeMillis() + totalDurationMs;
 
             // Launch initial batch of calls with staggering
-            for (int i = 0; i < concurrentCalls; i++) {
+            for (int i = 0; i < concurrentCalls && !stopRequested; i++) {
                 PhoneSlot slot = freePhones.poll(timeoutSeconds, TimeUnit.SECONDS);
                 if (slot == null) {
                     log.warn("Could not get free phone for initial call {}", i);
@@ -180,14 +233,15 @@ public class SustainedLoadScenario {
                 }
                 launchCall(slot, phoneB, freePhones, deadline, executor);
                 if (i < concurrentCalls - 1) {
-                    Thread.sleep(STAGGER_DELAY_MS);
+                    Thread.sleep(staggerDelayMs);
                 }
             }
 
-            // Wait for the total duration to expire, then wait for in-flight calls to finish
+            // Wait for the total duration to expire (or stop requested)
             long remaining = deadline - System.currentTimeMillis();
-            if (remaining > 0) {
-                Thread.sleep(remaining);
+            while (remaining > 0 && !stopRequested) {
+                Thread.sleep(Math.min(remaining, 500));
+                remaining = deadline - System.currentTimeMillis();
             }
 
             // Wait for all active calls to finish (with a grace period)
@@ -241,13 +295,14 @@ public class SustainedLoadScenario {
             } catch (Exception e) {
                 log.error("Call failed on slot {}: {}", slot.index, e.getMessage(), e);
                 callsFailed.incrementAndGet();
+                fireEvent(String.format("Call FAILED on slot %d: %s", slot.index, e.getMessage()));
             } finally {
                 activeCalls.decrementAndGet();
                 slot.phone.resetCallState();
                 slot.resetLatches();
 
-                // If we still have time, launch a replacement call
-                if (System.currentTimeMillis() < deadline) {
+                // If we still have time and stop not requested, launch a replacement call
+                if (System.currentTimeMillis() < deadline && !stopRequested) {
                     freePhones.offer(slot);
                     try {
                         PhoneSlot nextSlot = freePhones.poll(1, TimeUnit.SECONDS);
@@ -273,6 +328,7 @@ public class SustainedLoadScenario {
         Instant callStart = Instant.now();
         callsStarted.incrementAndGet();
         activeCalls.incrementAndGet();
+        fireEvent(String.format("Call #%d started (slot %d)", callsStarted.get(), slot.index));
 
         // --- INVITE ---
         slot.phone.call(phoneBConfig.sipUri());
@@ -335,6 +391,7 @@ public class SustainedLoadScenario {
 
         callsCompleted.incrementAndGet();
         log.debug("Call completed on slot {} (setup: {}ms)", slot.index, setupMs);
+        fireEvent(String.format("Call #%d completed (slot %d, setup: %dms)", callsStarted.get(), slot.index, setupMs));
     }
 
     private SipPhoneListener createBPhoneListener(AtomicReference<SipPhone> phoneBRef,
@@ -432,6 +489,9 @@ public class SustainedLoadScenario {
     }
 
     void printLiveStats(Instant scenarioStart) {
+        // In TUI mode (event listener set), the dashboard reads metrics directly — skip console output
+        if (eventListener != null) return;
+
         long elapsed = Duration.between(scenarioStart, Instant.now()).getSeconds();
         long completed = callsCompleted.get();
         long failed = callsFailed.get();
@@ -488,24 +548,26 @@ public class SustainedLoadScenario {
                     : TestReport.CheckResult.fail("Tone Detection", tonePassed + "/" + toneTotal + " passed", Duration.ZERO));
         }
 
-        // Print detailed summary to console
-        System.out.println();
-        System.out.println("====================================");
-        System.out.printf(" SCENARIO: Sustained Load (%d concurrent, %ds)%n", concurrentCalls, totalDurationMs / 1000);
-        System.out.println("====================================");
-        System.out.printf("  Total calls attempted:  %d%n", totalAttempted);
-        System.out.printf("  Total calls completed:  %d%n", completed);
-        System.out.printf("  Total calls failed:     %d%n", failed);
-        System.out.printf("  Calls/sec (avg):        %.2f%n", rate);
-        System.out.printf("  Setup latency (avg):    %dms%n", avgSetup);
-        System.out.printf("  Setup latency (p95):    %dms%n", p95Setup);
-        System.out.printf("  Setup latency (p99):    %dms%n", p99Setup);
-        if (toneTotal > 0) {
-            System.out.printf("  Tone tests passed:      %d/%d%n", tonePassed, toneTotal);
+        // Print detailed summary to console (skip in TUI mode — dashboard shows results)
+        if (eventListener == null) {
+            System.out.println();
+            System.out.println("====================================");
+            System.out.printf(" SCENARIO: Sustained Load (%d concurrent, %ds)%n", concurrentCalls, totalDurationMs / 1000);
+            System.out.println("====================================");
+            System.out.printf("  Total calls attempted:  %d%n", totalAttempted);
+            System.out.printf("  Total calls completed:  %d%n", completed);
+            System.out.printf("  Total calls failed:     %d%n", failed);
+            System.out.printf("  Calls/sec (avg):        %.2f%n", rate);
+            System.out.printf("  Setup latency (avg):    %dms%n", avgSetup);
+            System.out.printf("  Setup latency (p95):    %dms%n", p95Setup);
+            System.out.printf("  Setup latency (p99):    %dms%n", p99Setup);
+            if (toneTotal > 0) {
+                System.out.printf("  Tone tests passed:      %d/%d%n", tonePassed, toneTotal);
+            }
+            System.out.printf("  Duration:               %dms%n", totalDur.toMillis());
+            System.out.printf("  Result: %s (%.1f%% pass rate)%n", success ? "SUCCESS" : "FAILURE", passRate);
+            System.out.println("====================================");
         }
-        System.out.printf("  Duration:               %dms%n", totalDur.toMillis());
-        System.out.printf("  Result: %s (%.1f%% pass rate)%n", success ? "SUCCESS" : "FAILURE", passRate);
-        System.out.println("====================================");
     }
 
     private boolean detectTone(List<RtpPacket> packets) {
@@ -548,6 +610,25 @@ public class SustainedLoadScenario {
         try (DatagramSocket ds = new DatagramSocket(0)) {
             return ds.getLocalPort();
         }
+    }
+
+    private void fireEvent(String message) {
+        ScenarioEventListener listener = this.eventListener;
+        if (listener != null) {
+            try {
+                listener.onEvent(message);
+            } catch (Exception e) {
+                log.debug("Event listener error: {}", e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Callback interface for scenario events (used by the TUI dashboard).
+     */
+    @FunctionalInterface
+    public interface ScenarioEventListener {
+        void onEvent(String message);
     }
 
     /**

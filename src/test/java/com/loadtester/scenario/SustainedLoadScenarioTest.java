@@ -13,6 +13,9 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -201,5 +204,147 @@ class SustainedLoadScenarioTest {
 
         assertThat(report.getChecks()).hasSize(numThreads * checksPerThread);
         assertThat(report.allPassed()).isTrue();
+    }
+
+    // --- New tests for stop, stagger, public metrics, event listener ---
+
+    @Test
+    void requestStopShouldSetFlag() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 5);
+
+        assertThat(scenario.isStopRequested()).isFalse();
+
+        scenario.requestStop();
+
+        assertThat(scenario.isStopRequested()).isTrue();
+    }
+
+    @Test
+    void staggerDelayShouldBeConfigurable() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 5);
+
+        // Default should be 500ms
+        assertThat(scenario.getStaggerDelayMs()).isEqualTo(500);
+
+        scenario.setStaggerDelayMs(200);
+        assertThat(scenario.getStaggerDelayMs()).isEqualTo(200);
+
+        scenario.setStaggerDelayMs(1000);
+        assertThat(scenario.getStaggerDelayMs()).isEqualTo(1000);
+    }
+
+    @Test
+    void publicMetricAccessorsShouldReturnCorrectValues() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 10);
+
+        // Manipulate internal counters via package-private accessors
+        scenario.getCallsStarted().set(100);
+        scenario.getCallsCompleted().set(95);
+        scenario.getCallsFailed().set(5);
+        scenario.getActiveCalls().set(8);
+        scenario.getToneTestsPassed().set(7);
+        scenario.getToneTestsTotal().set(7);
+
+        // Public accessors should reflect the same values
+        assertThat(scenario.getCallsStartedCount()).isEqualTo(100);
+        assertThat(scenario.getCallsCompletedCount()).isEqualTo(95);
+        assertThat(scenario.getCallsFailedCount()).isEqualTo(5);
+        assertThat(scenario.getActiveCallsCount()).isEqualTo(8);
+        assertThat(scenario.getConcurrentCalls()).isEqualTo(10);
+        assertThat(scenario.getToneTestsPassedCount()).isEqualTo(7);
+        assertThat(scenario.getToneTestsTotalCount()).isEqualTo(7);
+    }
+
+    @Test
+    void latencyStatsShouldComputeCorrectly() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 5);
+
+        // Empty latencies
+        assertThat(scenario.getAvgSetupLatencyMs()).isEqualTo(0);
+        assertThat(scenario.getP95SetupLatencyMs()).isEqualTo(0);
+        assertThat(scenario.getP99SetupLatencyMs()).isEqualTo(0);
+
+        // Add some latencies: 100, 200, 300, 400, 500
+        for (long l = 100; l <= 500; l += 100) {
+            scenario.getSetupLatencies().add(l);
+        }
+
+        assertThat(scenario.getAvgSetupLatencyMs()).isEqualTo(300); // (100+200+300+400+500)/5
+        assertThat(scenario.getP95SetupLatencyMs()).isEqualTo(500); // 5*0.95=4.75 -> index 4 -> 500
+        assertThat(scenario.getP99SetupLatencyMs()).isEqualTo(500); // 5*0.99=4.95 -> index 4 -> 500
+    }
+
+    @Test
+    void latencyP95ShouldWorkWithManyValues() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 5);
+
+        // Add 100 latencies: 1, 2, 3, ..., 100
+        for (long l = 1; l <= 100; l++) {
+            scenario.getSetupLatencies().add(l);
+        }
+
+        assertThat(scenario.getAvgSetupLatencyMs()).isEqualTo(50); // sum(1..100)/100 = 5050/100 = 50
+        assertThat(scenario.getP95SetupLatencyMs()).isEqualTo(96); // 100*0.95=95 -> index 95 -> value 96
+        assertThat(scenario.getP99SetupLatencyMs()).isEqualTo(100); // 100*0.99=99 -> index 99 -> value 100
+    }
+
+    @Test
+    void totalDurationMsShouldBeExposed() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 5);
+
+        // Default
+        assertThat(scenario.getTotalDurationMs()).isEqualTo(60_000);
+
+        scenario.setTotalDurationMs(120_000);
+        assertThat(scenario.getTotalDurationMs()).isEqualTo(120_000);
+    }
+
+    @Test
+    void scenarioStartShouldBeNullBeforeExecute() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 5);
+
+        assertThat(scenario.getScenarioStart()).isNull();
+    }
+
+    @Test
+    void eventListenerShouldReceiveStopEvent() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 5);
+
+        List<String> events = new ArrayList<>();
+        scenario.setEventListener(events::add);
+
+        scenario.requestStop();
+
+        assertThat(events).hasSize(1);
+        assertThat(events.get(0)).contains("Stop requested");
+    }
+
+    @Test
+    void eventListenerExceptionShouldNotPropagate() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 5);
+
+        scenario.setEventListener(msg -> { throw new RuntimeException("listener error"); });
+
+        // requestStop fires an event — the listener exception should not propagate
+        assertThatCode(scenario::requestStop).doesNotThrowAnyException();
+        assertThat(scenario.isStopRequested()).isTrue();
+    }
+
+    @Test
+    void nullEventListenerShouldNotCauseErrors() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 5);
+
+        // No listener set — requestStop should work fine
+        assertThatCode(scenario::requestStop).doesNotThrowAnyException();
     }
 }
