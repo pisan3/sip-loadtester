@@ -170,4 +170,104 @@ class UdpRtpSessionTest {
         sessionA = new UdpRtpSession();
         assertThat(sessionA.getLocalPort()).isEqualTo(-1);
     }
+
+    @Test
+    void resetShouldAllowReuse() throws Exception {
+        sessionA = new UdpRtpSession();
+        sessionA.start(0);
+        assertThat(sessionA.isRunning()).isTrue();
+        int originalPort = sessionA.getLocalPort();
+
+        // Reset the session
+        sessionA.reset();
+        assertThat(sessionA.isRunning()).isFalse();
+        assertThat(sessionA.getLocalPort()).isEqualTo(-1);
+
+        // Should be able to start again
+        sessionA.start(0);
+        assertThat(sessionA.isRunning()).isTrue();
+        assertThat(sessionA.getLocalPort()).isGreaterThan(0);
+    }
+
+    @Test
+    void resetShouldClearReceivedPackets() throws Exception {
+        sessionA = new UdpRtpSession();
+        sessionB = new UdpRtpSession();
+        sessionA.start(0);
+        sessionB.start(0);
+
+        InetAddress localhost = InetAddress.getByName("127.0.0.1");
+        sessionA.setRemote(localhost, sessionB.getLocalPort());
+
+        // Send and receive some packets
+        for (int i = 0; i < 3; i++) {
+            RtpPacket pkt = new RtpPacket(0, i, i * 160, 0x1234L, new byte[]{(byte) i});
+            sessionA.sendPacket(pkt);
+        }
+        for (int i = 0; i < 3; i++) {
+            sessionB.receivePacket(2000);
+        }
+        assertThat(sessionB.getReceivedPackets()).hasSize(3);
+
+        // Reset should clear them
+        sessionB.reset();
+        assertThat(sessionB.getReceivedPackets()).isEmpty();
+    }
+
+    @Test
+    void resetOnStoppedSessionShouldNotThrow() {
+        sessionA = new UdpRtpSession();
+        // Not started — reset should be safe
+        assertThatCode(() -> sessionA.reset()).doesNotThrowAnyException();
+    }
+
+    @Test
+    void setAccumulatePacketsFalseShouldSkipStorage() throws Exception {
+        sessionA = new UdpRtpSession();
+        sessionB = new UdpRtpSession();
+        sessionA.start(0);
+        sessionB.start(0);
+
+        InetAddress localhost = InetAddress.getByName("127.0.0.1");
+        sessionA.setRemote(localhost, sessionB.getLocalPort());
+
+        // Disable accumulation on receiver
+        sessionB.setAccumulatePackets(false);
+
+        // Send packets
+        for (int i = 0; i < 5; i++) {
+            RtpPacket pkt = new RtpPacket(0, i, i * 160, 0x1234L, new byte[]{(byte) i});
+            sessionA.sendPacket(pkt);
+        }
+
+        // Receive them (should still return the packet, just not store it)
+        for (int i = 0; i < 5; i++) {
+            RtpPacket recv = sessionB.receivePacket(2000);
+            assertThat(recv).isNotNull();
+        }
+
+        // No packets stored
+        assertThat(sessionB.getReceivedPackets()).isEmpty();
+    }
+
+    @Test
+    void setAccumulatePacketsTrueShouldStorePackets() throws Exception {
+        sessionA = new UdpRtpSession();
+        sessionB = new UdpRtpSession();
+        sessionA.start(0);
+        sessionB.start(0);
+
+        InetAddress localhost = InetAddress.getByName("127.0.0.1");
+        sessionA.setRemote(localhost, sessionB.getLocalPort());
+
+        // Re-enable accumulation (default is true, but test explicitly)
+        sessionB.setAccumulatePackets(true);
+
+        RtpPacket pkt = new RtpPacket(0, 0, 0, 0x1234L, new byte[]{0x01});
+        sessionA.sendPacket(pkt);
+
+        RtpPacket recv = sessionB.receivePacket(2000);
+        assertThat(recv).isNotNull();
+        assertThat(sessionB.getReceivedPackets()).hasSize(1);
+    }
 }

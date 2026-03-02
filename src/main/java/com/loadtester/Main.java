@@ -4,6 +4,7 @@ import com.loadtester.config.SipAccountConfig;
 import com.loadtester.report.TestReport;
 import com.loadtester.scenario.CallScenario;
 import com.loadtester.scenario.ConcurrentCallScenario;
+import com.loadtester.scenario.SustainedLoadScenario;
 import com.loadtester.sip.DefaultSipStackFactory;
 
 import java.net.InetAddress;
@@ -28,14 +29,19 @@ public class Main {
                 System.exit(1);
             }
 
-            System.out.println("SIP Load Tester — A-calls-B Scenario");
+            System.out.println("SIP Load Tester");
             System.out.println("Proxy: " + cfg.proxyHost + ":" + cfg.proxyPort);
             System.out.println("Domain: " + cfg.domain);
             System.out.println("Phone A: " + cfg.aUser);
             System.out.println("Phone B: " + cfg.bUser);
             System.out.println("Local IP: " + cfg.localIp);
-            if (cfg.concurrent > 1) {
+            System.out.println("Scenario: " + cfg.scenario);
+            if (cfg.concurrent > 1 || "sustained".equals(cfg.scenario)) {
                 System.out.println("Concurrent calls: " + cfg.concurrent);
+            }
+            if ("sustained".equals(cfg.scenario)) {
+                System.out.println("Call duration: " + cfg.callDuration + "ms");
+                System.out.println("Total duration: " + cfg.totalDuration + "ms");
             }
             System.out.println();
 
@@ -47,7 +53,15 @@ public class Main {
                     cfg.bUser, cfg.bAuthUser);
 
             TestReport report;
-            if (cfg.concurrent > 1) {
+            if ("sustained".equals(cfg.scenario)) {
+                SustainedLoadScenario scenario = new SustainedLoadScenario(
+                        phoneAConfig, phoneBConfig,
+                        new DefaultSipStackFactory(), cfg.localIp, cfg.concurrent);
+                scenario.setCallDurationMs(cfg.callDuration);
+                scenario.setTotalDurationMs(cfg.totalDuration);
+                scenario.setTimeoutSeconds(cfg.timeout);
+                report = scenario.execute();
+            } else if (cfg.concurrent > 1) {
                 ConcurrentCallScenario scenario = new ConcurrentCallScenario(
                         phoneAConfig, phoneBConfig,
                         new DefaultSipStackFactory(), cfg.localIp, cfg.concurrent);
@@ -90,6 +104,9 @@ public class Main {
                 case "--media-duration" -> cfg.mediaDuration = Integer.parseInt(args[++i]);
                 case "--timeout" -> cfg.timeout = Integer.parseInt(args[++i]);
                 case "--concurrent" -> cfg.concurrent = Integer.parseInt(args[++i]);
+                case "--scenario" -> cfg.scenario = args[++i];
+                case "--call-duration" -> cfg.callDuration = Long.parseLong(args[++i]);
+                case "--total-duration" -> cfg.totalDuration = Long.parseLong(args[++i]);
                 case "--help", "-h" -> { printUsage(); System.exit(0); }
                 default -> {
                     System.err.println("Unknown argument: " + args[i]);
@@ -134,6 +151,9 @@ public class Main {
         System.out.println("  --media-duration <ms>   RTP tone duration in ms (default: 3000)");
         System.out.println("  --timeout <seconds>     SIP timeout in seconds (default: 10)");
         System.out.println("  --concurrent <N>        Number of concurrent calls (default: 1)");
+        System.out.println("  --scenario <name>       Scenario: single, concurrent, sustained (default: single)");
+        System.out.println("  --call-duration <ms>    Duration of each call in sustained mode (default: 30000)");
+        System.out.println("  --total-duration <ms>   Total test duration in sustained mode (default: 60000)");
         System.out.println("  -h, --help              Show this help");
     }
 
@@ -151,5 +171,8 @@ public class Main {
         int mediaDuration = 3000;
         int timeout = 10;
         int concurrent = 1;
+        String scenario = "single";
+        long callDuration = 30_000;
+        long totalDuration = 60_000;
     }
 }

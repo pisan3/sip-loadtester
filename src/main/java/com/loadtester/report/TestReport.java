@@ -2,9 +2,9 @@ package com.loadtester.report;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Collects timing measurements and pass/fail results for a test scenario.
@@ -32,7 +32,7 @@ public class TestReport {
     private final String scenarioName;
     private final Instant startTime;
     private Instant endTime;
-    private final List<CheckResult> checks = new ArrayList<>();
+    private final List<CheckResult> checks = new CopyOnWriteArrayList<>();
 
     public TestReport(String scenarioName) {
         this.scenarioName = scenarioName;

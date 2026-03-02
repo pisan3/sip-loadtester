@@ -54,4 +54,23 @@ public interface RtpSession {
      * Check if the session is running.
      */
     boolean isRunning();
+
+    /**
+     * Reset the session so it can be reused for a new call.
+     * Stops the session if running, clears received packets, and allows a subsequent start().
+     */
+    default void reset() {
+        if (isRunning()) {
+            stop();
+        }
+    }
+
+    /**
+     * Enable or disable packet accumulation. When disabled, received packets are not stored
+     * in memory (saves memory for calls that don't need tone detection).
+     * Default is enabled (true).
+     */
+    default void setAccumulatePackets(boolean accumulate) {
+        // no-op by default
+    }
 }

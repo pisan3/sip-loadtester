@@ -18,6 +18,9 @@ import java.text.ParseException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
@@ -66,6 +69,12 @@ public class SipPhone implements SipListener {
     private String lastMethod;
     private volatile boolean pendingUnregister;
     private final CountDownLatch unregisterLatch = new CountDownLatch(1);
+
+    // Re-registration timer: re-sends REGISTER before the Expires period lapses
+    private static final int REGISTER_EXPIRES_SECONDS = 60;
+    private static final int REREGISTER_INTERVAL_SECONDS = 50; // re-register 10s before expiry
+    private ScheduledExecutorService reregScheduler;
+    private ScheduledFuture<?> reregFuture;
 
     public SipPhone(SipAccountConfig config, SipStackFactory stackFactory,
                     RtpSession rtpSession, SipPhoneListener listener) {
@@ -362,6 +371,35 @@ public class SipPhone implements SipListener {
     }
 
     /**
+     * Reset per-call state so this phone can make a new call while staying registered.
+     * <p>
+     * Clears: callId, currentDialog, currentClientTransaction, currentServerTransaction,
+     * remoteSdpInfo, lastSentRequest, lastMethod. Stops/resets the RTP session.
+     * Does NOT unregister or shut down the SipStack. The phone remains registered.
+     * Generates a new local tag for the next call.
+     */
+    public void resetCallState() {
+        // Stop RTP session if running and reset it for reuse
+        if (rtpSession != null) {
+            rtpSession.reset();
+        }
+
+        this.callId = null;
+        this.currentDialog = null;
+        this.currentClientTransaction = null;
+        this.currentServerTransaction = null;
+        this.remoteSdpInfo = null;
+        this.lastSentRequest = null;
+        this.lastMethod = null;
+        this.remoteTag = null;
+
+        // New local tag for the next call (SIP requires unique From-tag per dialog)
+        this.localTag = Long.toHexString(new Random().nextLong());
+
+        log.debug("[{}] Call state reset — phone ready for new call", config.username());
+    }
+
+    /**
      * Send a REGISTER with Expires: 0 to de-register from the proxy.
      * This is fire-and-forget — we don't wait for the response.
      */
@@ -405,9 +443,97 @@ public class SipPhone implements SipListener {
     }
 
     /**
+     * Send a re-REGISTER to refresh the registration binding before it expires.
+     * This is called by the re-registration scheduler. The request goes through
+     * the normal 401 challenge flow via handleAuthChallenge, which is now stateless
+     * (extracts original request from the ClientTransaction, not from instance fields).
+     */
+    void sendReRegistration() {
+        try {
+            if (sipProvider == null || pendingUnregister) {
+                return;
+            }
+            String sipUser = config.effectiveAuthUsername();
+            SipURI requestUri = addressFactory.createSipURI(null, config.domain());
+
+            SipURI fromUri = addressFactory.createSipURI(sipUser, config.domain());
+            Address fromAddress = addressFactory.createAddress(fromUri);
+            fromAddress.setDisplayName(config.displayName());
+            // Use a fresh tag for re-registration to avoid From-tag collisions
+            String reregTag = Long.toHexString(new Random().nextLong());
+            FromHeader fromHeader = headerFactory.createFromHeader(fromAddress, reregTag);
+
+            Address toAddress = addressFactory.createAddress(addressFactory.createSipURI(sipUser, config.domain()));
+            ToHeader toHeader = headerFactory.createToHeader(toAddress, null);
+
+            List<ViaHeader> viaHeaders = createViaHeaders();
+            MaxForwardsHeader maxForwards = headerFactory.createMaxForwardsHeader(70);
+            CallIdHeader callIdHeader = sipProvider.getNewCallId();
+            CSeqHeader cseqHeader = headerFactory.createCSeqHeader(cseqCounter.getAndIncrement(), Request.REGISTER);
+
+            Request request = messageFactory.createRequest(requestUri, Request.REGISTER,
+                    callIdHeader, cseqHeader, fromHeader, toHeader, viaHeaders, maxForwards);
+
+            // Contact header
+            SipURI contactUri = addressFactory.createSipURI(sipUser, localIp);
+            contactUri.setPort(localSipPort);
+            contactUri.setTransportParam("udp");
+            Address contactAddress = addressFactory.createAddress(contactUri);
+            ContactHeader contactHeader = headerFactory.createContactHeader(contactAddress);
+            request.addHeader(contactHeader);
+
+            // Expires
+            ExpiresHeader expiresHeader = headerFactory.createExpiresHeader(REGISTER_EXPIRES_SECONDS);
+            request.addHeader(expiresHeader);
+
+            ClientTransaction ct = sipProvider.getNewClientTransaction(request);
+            ct.sendRequest();
+            log.info("[{}] Re-REGISTER sent (refresh before expiry)", config.username());
+        } catch (Exception e) {
+            log.error("[{}] Re-registration failed: {}", config.username(), e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Start the periodic re-registration timer.
+     * Called after the first successful registration.
+     */
+    private void startReRegistrationTimer() {
+        stopReRegistrationTimer(); // cancel any previous timer
+        reregScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "rereg-" + config.username());
+            t.setDaemon(true);
+            return t;
+        });
+        reregFuture = reregScheduler.scheduleAtFixedRate(
+                this::sendReRegistration,
+                REREGISTER_INTERVAL_SECONDS,
+                REREGISTER_INTERVAL_SECONDS,
+                TimeUnit.SECONDS);
+        log.info("[{}] Re-registration timer started (every {}s)", config.username(), REREGISTER_INTERVAL_SECONDS);
+    }
+
+    /**
+     * Stop the periodic re-registration timer.
+     */
+    private void stopReRegistrationTimer() {
+        if (reregFuture != null) {
+            reregFuture.cancel(false);
+            reregFuture = null;
+        }
+        if (reregScheduler != null) {
+            reregScheduler.shutdownNow();
+            reregScheduler = null;
+        }
+    }
+
+    /**
      * Shutdown the SIP stack and release resources.
      */
     public void shutdown() {
+        // Stop re-registration timer first
+        stopReRegistrationTimer();
+
         // Stop all call leg RTP sessions
         for (CallLeg leg : callLegs.values()) {
             RtpSession legRtp = leg.getRtpSession();
@@ -630,9 +756,16 @@ public class SipPhone implements SipListener {
 
         DigestAuthHelper.Challenge challenge = DigestAuthHelper.parseChallenge(challengeHeader.toString().split(":", 2)[1].trim());
 
+        // Extract method from the response's CSeq (stateless — no reliance on instance fields)
         CSeqHeader cseq = (CSeqHeader) response.getHeader(CSeqHeader.NAME);
         String method = cseq.getMethod();
-        String uri = lastSentRequest.getRequestURI().toString();
+
+        // Get the original request from the ClientTransaction (thread-safe: each
+        // transaction holds its own request, so re-registration and INVITE auth
+        // don't interfere with each other).
+        ClientTransaction originalTx = event.getClientTransaction();
+        Request originalRequest = (originalTx != null) ? originalTx.getRequest() : lastSentRequest;
+        String uri = originalRequest.getRequestURI().toString();
 
         String nc = "00000001";
         String cnonce = DigestAuthHelper.generateCNonce();
@@ -641,7 +774,7 @@ public class SipPhone implements SipListener {
                 challenge.nonce(), method, uri, challenge.qop(), nc, cnonce);
 
         // Clone the original request with new CSeq, Via branch, and auth header
-        Request newRequest = (Request) lastSentRequest.clone();
+        Request newRequest = (Request) originalRequest.clone();
         CSeqHeader newCSeq = headerFactory.createCSeqHeader(cseqCounter.getAndIncrement(), method);
         newRequest.setHeader(newCSeq);
 
@@ -698,6 +831,8 @@ public class SipPhone implements SipListener {
                 listener.onUnregistered();
             } else {
                 log.info("[{}] Registration successful", config.username());
+                // Start (or restart) the re-registration timer to keep the binding alive
+                startReRegistrationTimer();
                 listener.onRegistered();
             }
         } else if (Request.INVITE.equals(method)) {

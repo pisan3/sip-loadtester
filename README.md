@@ -43,6 +43,18 @@ java -jar target/sip-loadtester-1.0-SNAPSHOT.jar \
   --concurrent 10
 ```
 
+### Run sustained load (10 concurrent calls for 5 minutes)
+
+```bash
+java -jar target/sip-loadtester-1.0-SNAPSHOT.jar \
+  --proxy-host $SIP_PROXY_HOST --proxy-port $SIP_PROXY_PORT \
+  --domain $SIP_DOMAIN \
+  --a-user $SIP_A_USER --a-password $SIP_A_PASSWORD --a-auth-user $SIP_A_AUTH_USER \
+  --b-user $SIP_B_USER --b-password $SIP_B_PASSWORD --b-auth-user $SIP_B_AUTH_USER \
+  --local-ip $LOCAL_IP \
+  --scenario sustained --concurrent 10 --call-duration 30000 --total-duration 300000
+```
+
 > **Note:** Set the environment variables in a `.env` file (see `.env` in the project root).
 > You can source it before running: `source .env && java -jar ...`
 
@@ -63,6 +75,9 @@ java -jar target/sip-loadtester-1.0-SNAPSHOT.jar \
 | `--media-duration` | No | 3000 | RTP tone duration in milliseconds |
 | `--timeout` | No | 10 | SIP signaling timeout in seconds |
 | `--concurrent` | No | 1 | Number of concurrent calls |
+| `--scenario` | No | single | Scenario type: `single`, `concurrent`, or `sustained` |
+| `--call-duration` | No | 30000 | Duration of each call in sustained mode (ms) |
+| `--total-duration` | No | 60000 | Total test duration in sustained mode (ms) |
 
 The process exits with code 0 on success, 1 on test failure, 2 on fatal error.
 
@@ -88,6 +103,43 @@ The process exits with code 0 on success, 1 on test failure, 2 on fatal error.
 - B auto-answers each INVITE immediately in the SIP callback thread
 - All N calls run RTP in parallel for the configured duration
 - All calls are torn down and verified independently
+
+### Sustained Load Scenario
+
+Maintains a constant number of concurrent calls over a configurable time period. When a call completes, the phone is reset and immediately starts a new call.
+
+- 1 shared Phone B auto-answers all incoming calls
+- N A-phones are registered once and reused across calls via `resetCallState()`
+- Each call: INVITE -> 200 OK -> RTP for `--call-duration` ms -> BYE -> reset -> next call
+- ~10% of calls are sampled for tone detection (Goertzel algorithm)
+- Live stats printed every 5 seconds during the run
+- After `--total-duration` expires, in-flight calls finish and final summary is printed
+- Success criteria: >= 95% call pass rate
+
+#### Live Stats
+
+```
+[00:15] Active: 10 | Completed: 28 | Failed: 0 | Rate: 1.9 calls/sec | Avg setup: 245ms | Tone: 3/3 passed
+```
+
+#### Final Report
+
+```
+====================================
+ SCENARIO: Sustained Load (10 concurrent, 60s)
+====================================
+  Total calls attempted:  120
+  Total calls completed:  118
+  Total calls failed:       2
+  Calls/sec (avg):        1.97
+  Setup latency (avg):    248ms
+  Setup latency (p95):    412ms
+  Setup latency (p99):    523ms
+  Tone tests passed:      12/12
+  Duration:               60023ms
+  Result: SUCCESS (98.3% pass rate)
+====================================
+```
 
 ### Report Output
 
@@ -135,30 +187,32 @@ src/main/java/com/loadtester/
 │   └── ToneDetector.java              Goertzel algorithm tone detector
 ├── scenario/
 │   ├── CallScenario.java              Single A-calls-B orchestrator
-│   └── ConcurrentCallScenario.java    N concurrent calls orchestrator
+│   ├── ConcurrentCallScenario.java    N concurrent calls orchestrator
+│   └── SustainedLoadScenario.java     Sustained load (N calls for T duration)
 └── report/
     └── TestReport.java                Pass/fail check collection + summary
 
 src/test/java/com/loadtester/
 ├── config/SipAccountConfigTest.java          14 tests
 ├── sip/
-│   ├── SipPhoneTest.java                     14 tests (mocked JAIN-SIP stack)
+│   ├── SipPhoneTest.java                     17 tests (mocked JAIN-SIP stack)
 │   ├── CallLegTest.java                       4 tests
 │   ├── SdpUtilTest.java                      17 tests
 │   └── DigestAuthHelperTest.java             16 tests
 ├── media/
 │   ├── RtpPacketTest.java                    17 tests
-│   ├── UdpRtpSessionTest.java               11 tests (loopback UDP)
+│   ├── UdpRtpSessionTest.java               16 tests (loopback UDP)
 │   ├── ToneGeneratorTest.java                12 tests
 │   ├── ToneDetectorTest.java                 19 tests (incl. Goertzel)
 │   └── ToneRoundTripTest.java                 3 tests (end-to-end media)
 └── scenario/
     ├── TestReportTest.java                    9 tests
+    ├── SustainedLoadScenarioTest.java         8 tests
     ├── CallScenarioIntegrationTest.java       @Disabled (real PBX)
     └── ConcurrentCallScenarioIntegrationTest.java  @Disabled (real PBX)
 ```
 
-**136 unit tests + 2 integration tests (disabled by default)**
+**154 unit tests + 2 integration tests (disabled by default)**
 
 ## Running Tests
 

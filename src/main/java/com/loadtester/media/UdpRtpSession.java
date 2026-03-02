@@ -27,6 +27,7 @@ public class UdpRtpSession implements RtpSession {
     private InetAddress remoteAddr;
     private int remotePort;
     private volatile boolean running;
+    private volatile boolean accumulatePackets = true;
     private final List<RtpPacket> receivedPackets = new CopyOnWriteArrayList<>();
 
     @Override
@@ -73,7 +74,9 @@ public class UdpRtpSession implements RtpSession {
         try {
             socket.receive(dgram);
             RtpPacket pkt = RtpPacket.decode(dgram.getData(), dgram.getLength());
-            receivedPackets.add(pkt);
+            if (accumulatePackets) {
+                receivedPackets.add(pkt);
+            }
             return pkt;
         } catch (SocketTimeoutException e) {
             return null;
@@ -102,5 +105,22 @@ public class UdpRtpSession implements RtpSession {
     @Override
     public boolean isRunning() {
         return running;
+    }
+
+    @Override
+    public void reset() {
+        if (running) {
+            stop();
+        }
+        receivedPackets.clear();
+        remoteAddr = null;
+        remotePort = 0;
+        socket = null;
+        log.debug("RTP session reset — ready for reuse");
+    }
+
+    @Override
+    public void setAccumulatePackets(boolean accumulate) {
+        this.accumulatePackets = accumulate;
     }
 }
