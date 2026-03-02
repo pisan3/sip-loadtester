@@ -50,6 +50,8 @@ public class SustainedLoadScenario {
     private long totalDurationMs = 60_000;
     private int timeoutSeconds = 30;
     private int staggerDelayMs = 500;
+    private int replacementDelayMs = -1; // -1 means "auto: staggerDelayMs / 2"
+    private int maxInFlightInvites = -1; // -1 means "auto: concurrentCalls"
 
     // --- Stop control ---
     private volatile boolean stopRequested;
@@ -70,6 +72,9 @@ public class SustainedLoadScenario {
     // Shared executor for RTP send/receive threads (set during execute())
     private volatile ExecutorService executor;
 
+    // Rate-limiting: prevents too many concurrent INVITEs awaiting auth
+    private volatile Semaphore inviteSemaphore;
+
     public SustainedLoadScenario(SipAccountConfig phoneAConfig, SipAccountConfig phoneBConfig,
                                   SipStackFactory stackFactory, String localIp, int concurrentCalls) {
         this.phoneAConfig = phoneAConfig;
@@ -84,6 +89,16 @@ public class SustainedLoadScenario {
     public void setTimeoutSeconds(int timeoutSeconds) { this.timeoutSeconds = timeoutSeconds; }
     public void setStaggerDelayMs(int staggerDelayMs) { this.staggerDelayMs = staggerDelayMs; }
     public void setEventListener(ScenarioEventListener listener) { this.eventListener = listener; }
+    public void setMaxInFlightInvites(int max) { this.maxInFlightInvites = max; }
+    public void setReplacementDelayMs(int delayMs) { this.replacementDelayMs = delayMs; }
+
+    public int getMaxInFlightInvites() {
+        return maxInFlightInvites > 0 ? maxInFlightInvites : concurrentCalls;
+    }
+
+    public int getReplacementDelayMs() {
+        return replacementDelayMs >= 0 ? replacementDelayMs : staggerDelayMs / 2;
+    }
 
     /**
      * Request the scenario to stop gracefully. No new calls will be launched
@@ -145,6 +160,7 @@ public class SustainedLoadScenario {
         TestReport report = new TestReport(
                 String.format("Sustained Load (%d concurrent, %ds)", concurrentCalls, totalDurationMs / 1000));
         executor = Executors.newCachedThreadPool();
+        inviteSemaphore = new Semaphore(getMaxInFlightInvites());
         ScheduledExecutorService statsScheduler = Executors.newSingleThreadScheduledExecutor();
         scenarioStart = Instant.now();
 
@@ -211,6 +227,17 @@ public class SustainedLoadScenario {
             }
             report.addCheck(TestReport.CheckResult.pass(
                     "A-phones Registration (" + concurrentCalls + ")", regADur));
+
+            // Disable re-registration for short tests (< REGISTER_EXPIRES = 60s)
+            // to avoid 30+ phones bursting simultaneous re-REGISTERs that compete with INVITEs
+            boolean shortTest = totalDurationMs < 60_000;
+            if (shortTest) {
+                log.info("Short test ({}s < 60s) — disabling re-registration on all phones", totalDurationMs / 1000);
+                for (PhoneSlot slot : allPhoneSlots) {
+                    slot.phone.setReRegistrationEnabled(false);
+                }
+                phoneB.setReRegistrationEnabled(false);
+            }
 
             // All phones start in free pool
             for (PhoneSlot slot : allPhoneSlots) {
@@ -279,6 +306,9 @@ public class SustainedLoadScenario {
      * Launch a single call on the given phone slot. When the call completes,
      * the phone is reset and returned to the free pool, and if we haven't passed
      * the deadline, a new call is started with the next free phone.
+     * <p>
+     * Rate-limited by {@link #inviteSemaphore} to prevent too many concurrent
+     * INVITE auth cycles overwhelming the SIP proxy.
      */
     void launchCall(PhoneSlot slot, SipPhone phoneB, BlockingQueue<PhoneSlot> freePhones,
                     long deadline, ExecutorService executor) {
@@ -290,21 +320,38 @@ public class SustainedLoadScenario {
                 toneTestsTotal.incrementAndGet();
             }
 
+            // Rate-limit: acquire permit before sending INVITE
+            boolean acquired = false;
             try {
+                acquired = inviteSemaphore.tryAcquire(timeoutSeconds, TimeUnit.SECONDS);
+                if (!acquired) {
+                    log.warn("Slot {} could not acquire invite permit within timeout", slot.index);
+                    callsFailed.incrementAndGet();
+                    fireEvent(String.format("Call FAILED on slot %d: invite rate-limit timeout", slot.index));
+                    return;
+                }
                 runSingleCall(slot, phoneB, toneTest, executor);
             } catch (Exception e) {
                 log.error("Call failed on slot {}: {}", slot.index, e.getMessage(), e);
                 callsFailed.incrementAndGet();
                 fireEvent(String.format("Call FAILED on slot %d: %s", slot.index, e.getMessage()));
             } finally {
+                if (acquired) {
+                    inviteSemaphore.release();
+                }
                 activeCalls.decrementAndGet();
                 slot.phone.resetCallState();
                 slot.resetLatches();
 
                 // If we still have time and stop not requested, launch a replacement call
+                // with a delay to prevent burst of simultaneous INVITEs
                 if (System.currentTimeMillis() < deadline && !stopRequested) {
                     freePhones.offer(slot);
                     try {
+                        int delay = getReplacementDelayMs();
+                        if (delay > 0) {
+                            Thread.sleep(delay);
+                        }
                         PhoneSlot nextSlot = freePhones.poll(1, TimeUnit.SECONDS);
                         if (nextSlot != null) {
                             launchCall(nextSlot, phoneB, freePhones, deadline, executor);

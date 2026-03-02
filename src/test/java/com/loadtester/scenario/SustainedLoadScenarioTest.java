@@ -347,4 +347,55 @@ class SustainedLoadScenarioTest {
         // No listener set — requestStop should work fine
         assertThatCode(scenario::requestStop).doesNotThrowAnyException();
     }
+
+    // --- Fix 1: Rate-limiting replacement calls ---
+
+    @Test
+    void inviteSemaphoreDefaultShouldMatchConcurrentCalls() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 10);
+
+        // Default max in-flight should be concurrentCalls (not unlimited)
+        assertThat(scenario.getMaxInFlightInvites()).isEqualTo(10);
+    }
+
+    @Test
+    void maxInFlightInvitesShouldBeConfigurable() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 30);
+
+        scenario.setMaxInFlightInvites(5);
+        assertThat(scenario.getMaxInFlightInvites()).isEqualTo(5);
+    }
+
+    @Test
+    void replacementDelayMsShouldBeConfigurable() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 10);
+
+        // Default replacement delay should be > 0 (half of stagger delay)
+        assertThat(scenario.getReplacementDelayMs()).isGreaterThan(0);
+
+        scenario.setReplacementDelayMs(300);
+        assertThat(scenario.getReplacementDelayMs()).isEqualTo(300);
+    }
+
+    @Test
+    void defaultReplacementDelayShouldBeHalfOfStagger() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 10);
+
+        // Default stagger is 500ms, so replacement delay should be 250ms
+        assertThat(scenario.getReplacementDelayMs()).isEqualTo(250);
+    }
+
+    @Test
+    void replacementDelayShouldUpdateWithStaggerDelay() {
+        SustainedLoadScenario scenario = new SustainedLoadScenario(
+                phoneAConfig, phoneBConfig, mockStackFactory, "127.0.0.1", 10);
+
+        scenario.setStaggerDelayMs(1000);
+        // Replacement delay default is computed from stagger, so check it
+        assertThat(scenario.getReplacementDelayMs()).isEqualTo(500);
+    }
 }

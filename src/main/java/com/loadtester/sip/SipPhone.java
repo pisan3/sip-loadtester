@@ -75,6 +75,7 @@ public class SipPhone implements SipListener {
     private static final int REREGISTER_INTERVAL_SECONDS = 50; // re-register 10s before expiry
     private ScheduledExecutorService reregScheduler;
     private ScheduledFuture<?> reregFuture;
+    private volatile boolean reRegistrationEnabled = true;
 
     public SipPhone(SipAccountConfig config, SipStackFactory stackFactory,
                     RtpSession rtpSession, SipPhoneListener listener) {
@@ -95,6 +96,22 @@ public class SipPhone implements SipListener {
         this.rtpSessionFactory = rtpSessionFactory;
 
         this.localTag = Long.toHexString(new Random().nextLong());
+    }
+
+    /**
+     * Enable or disable the periodic re-registration timer.
+     * When disabled, no re-REGISTER requests will be sent after initial registration.
+     * Useful for short tests (duration &lt; REGISTER_EXPIRES_SECONDS) where re-registration is unnecessary.
+     */
+    public void setReRegistrationEnabled(boolean enabled) {
+        this.reRegistrationEnabled = enabled;
+        if (!enabled) {
+            stopReRegistrationTimer();
+        }
+    }
+
+    public boolean isReRegistrationEnabled() {
+        return reRegistrationEnabled;
     }
 
     /**
@@ -497,8 +514,13 @@ public class SipPhone implements SipListener {
     /**
      * Start the periodic re-registration timer.
      * Called after the first successful registration.
+     * Skipped if re-registration is disabled (e.g., for short tests).
      */
     private void startReRegistrationTimer() {
+        if (!reRegistrationEnabled) {
+            log.debug("[{}] Re-registration disabled — skipping timer start", config.username());
+            return;
+        }
         stopReRegistrationTimer(); // cancel any previous timer
         reregScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "rereg-" + config.username());
@@ -514,7 +536,7 @@ public class SipPhone implements SipListener {
     }
 
     /**
-     * Stop the periodic re-registration timer.
+     * Stop the periodic re-registration timer and wait for any in-flight task to finish.
      */
     private void stopReRegistrationTimer() {
         if (reregFuture != null) {
@@ -523,6 +545,14 @@ public class SipPhone implements SipListener {
         }
         if (reregScheduler != null) {
             reregScheduler.shutdownNow();
+            try {
+                if (!reregScheduler.awaitTermination(2, TimeUnit.SECONDS)) {
+                    log.warn("[{}] Re-registration scheduler did not terminate in time", config.username());
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.debug("[{}] Interrupted waiting for re-registration scheduler termination", config.username());
+            }
             reregScheduler = null;
         }
     }

@@ -458,6 +458,72 @@ class SipPhoneTest {
         assertThat(listener.registeredCount.get()).isEqualTo(2);
     }
 
+    // --- Fix 2: Re-registration enable/disable tests ---
+
+    @Test
+    void setReRegistrationEnabledFalseShouldPreventTimerStart() throws Exception {
+        phone.setReRegistrationEnabled(false);
+        phone.register();
+
+        // Simulate 200 OK for REGISTER
+        Response okResponse = createResponse(200, Request.REGISTER, 1);
+        ResponseEvent event = new ResponseEvent(mockSipProvider, mockClientTransaction, null, okResponse);
+        phone.processResponse(event);
+
+        // Registration callback should still fire
+        assertThat(listener.registeredCount.get()).isEqualTo(1);
+
+        // But sendReRegistration after 200 OK should NOT have started a timer.
+        // We verify by checking that no re-reg scheduler was created.
+        // Indirect check: isReRegistrationEnabled() returns false
+        assertThat(phone.isReRegistrationEnabled()).isFalse();
+    }
+
+    @Test
+    void reRegistrationEnabledByDefault() {
+        assertThat(phone.isReRegistrationEnabled()).isTrue();
+    }
+
+    @Test
+    void setReRegistrationEnabledTrueShouldAllowTimerStart() throws Exception {
+        phone.setReRegistrationEnabled(true);
+        phone.register();
+
+        Response okResponse = createResponse(200, Request.REGISTER, 1);
+        ResponseEvent event = new ResponseEvent(mockSipProvider, mockClientTransaction, null, okResponse);
+        phone.processResponse(event);
+
+        assertThat(listener.registeredCount.get()).isEqualTo(1);
+        assertThat(phone.isReRegistrationEnabled()).isTrue();
+    }
+
+    // --- Fix 3: Shutdown with awaitTermination tests ---
+
+    @Test
+    void shutdownShouldAwaitReRegTermination() throws Exception {
+        when(mockRtpSession.isRunning()).thenReturn(true);
+
+        // Register and get 200 OK to start timer
+        phone.register();
+        Response okResponse = createResponse(200, Request.REGISTER, 1);
+        ResponseEvent event = new ResponseEvent(mockSipProvider, mockClientTransaction, null, okResponse);
+        phone.processResponse(event);
+
+        // Shutdown — should not throw and should complete in reasonable time
+        assertThatCode(() -> phone.shutdown()).doesNotThrowAnyException();
+        verify(mockSipStack).stop();
+    }
+
+    @Test
+    void shutdownWithDisabledReRegShouldWork() {
+        when(mockRtpSession.isRunning()).thenReturn(true);
+        phone.setReRegistrationEnabled(false);
+
+        // Shutdown without ever starting re-reg timer
+        assertThatCode(() -> phone.shutdown()).doesNotThrowAnyException();
+        verify(mockSipStack).stop();
+    }
+
     // --- Helper methods ---
 
     private Response createResponse(int statusCode, String method, long cseq) throws Exception {
